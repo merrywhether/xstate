@@ -26,7 +26,12 @@ import {
   type TimerKey
 } from 'xstate';
 import { createDurable, type DurableEffect } from 'xstate/durable';
-import { EffectActor, safeCall, type MailboxItem } from './effectActor.ts';
+import {
+  EffectActor,
+  safeCall,
+  type CheckpointReceipt,
+  type MailboxItem
+} from './effectActor.ts';
 import {
   bindEffectHost,
   closeEffectHost,
@@ -49,8 +54,8 @@ const XSTATE_INIT = 'xstate.init';
 export type EffectActorOptions<TLogic extends AnyActorLogic> = {
   readonly input?: InputFrom<TLogic>;
   /**
-   * A snapshot from `actor.getPersistedSnapshot()`. The actor resumes in that
-   * state without re-running entry actions, and pending timers keep their
+   * A persisted snapshot, for example decoded from `checkpoint`. The actor
+   * resumes without re-running entry actions, and pending timers keep their
    * original deadlines, as with `restoreActor(logic, snapshot)` from
    * `xstate/persist`.
    * State-machine children resume their persisted state and completed
@@ -368,11 +373,16 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
         );
 
       const loop = Effect.gen(function* () {
+        const checkpoints: CheckpointReceipt[] = [];
         yield* executeEffects(effects);
         while (
           (snapshot as Snapshot<unknown>).status === 'active' &&
           !stopped
         ) {
+          // Capture without yielding so no mailbox event can overtake the snapshot.
+          while (checkpoints.length && Queue.sizeUnsafe(mailbox) === 0) {
+            checkpoints.shift()?.capture?.();
+          }
           delivered = undefined;
           const received = yield* Effect.promise(() =>
             durable.waitForEvent().catch(() => undefined)
@@ -382,6 +392,10 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
             EventFromLogic<TLogic>,
             SnapshotFrom<TLogic>
           > = getDelivered() ?? { kind: 'event', event: received };
+          if (item.kind === 'checkpoint') {
+            checkpoints.push(item.receipt);
+            continue;
+          }
           const receipt = item.kind === 'event' ? item.receipt : undefined;
           let event: EventFromLogic<TLogic>;
           if (item.kind === 'actionFailure') {
@@ -436,6 +450,10 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
           actor._publish(snapshot);
           if ((snapshot as Snapshot<unknown>).status !== 'active') {
             stopChildren(snapshot);
+            if ((snapshot as Snapshot<unknown>).status === 'done') {
+              // Final snapshots are published before their immediate effects finish.
+              actor._finishCheckpoints();
+            }
             closeEffectHost(host);
           }
         }

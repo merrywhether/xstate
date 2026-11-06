@@ -4,6 +4,7 @@ import type {
   Actor,
   ActorRef,
   AnyActor,
+  AnyActorLogic,
   AnyActorRef,
   AnyEventObject,
   EmittedFrom,
@@ -11,6 +12,7 @@ import type {
   ErrorFrom,
   InspectionEvent,
   OutputFrom,
+  PersistedSnapshotOf,
   Snapshot,
   SnapshotFrom,
   Subscription
@@ -113,6 +115,31 @@ export const send: {
     Effect.sync(() => {
       actor.send(event);
     })
+);
+
+/**
+ * Encodes a persisted snapshot after the actor's mailbox and immediate effects
+ * have drained. The encoder must be pure and synchronously return a string.
+ * Does not await running work, background actions or future timers.
+ *
+ * @experimental
+ */
+export const checkpoint: {
+  <TLogic extends AnyActorLogic>(
+    encode: (snapshot: PersistedSnapshotOf<TLogic>) => string
+  ): (
+    actor: EffectActor<TLogic>
+  ) => Effect.Effect<string, ActorStoppedError | Cause.UnknownError>;
+  <TLogic extends AnyActorLogic>(
+    actor: EffectActor<TLogic>,
+    encode: (snapshot: PersistedSnapshotOf<TLogic>) => string
+  ): Effect.Effect<string, ActorStoppedError | Cause.UnknownError>;
+} = dual(
+  2,
+  <TLogic extends AnyActorLogic>(
+    actor: EffectActor<TLogic>,
+    encode: (snapshot: PersistedSnapshotOf<TLogic>) => string
+  ) => actor._checkpoint(encode)
 );
 
 /**

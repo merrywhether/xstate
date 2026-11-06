@@ -1,4 +1,4 @@
-import { Effect, Exit, Queue } from 'effect';
+import { Cause, Effect, Exit, Queue } from 'effect';
 import { ActorStoppedError, EventRejectedError } from './errors.ts';
 import { StateMachine } from 'xstate';
 import type {
@@ -21,13 +21,19 @@ export interface Receipt<TSnapshot> {
   ) => void;
 }
 
+export interface CheckpointReceipt {
+  capture?: () => void;
+  reject?: () => void;
+}
+
 export type MailboxItem<TEvent, TSnapshot> =
   | {
       readonly kind: 'event';
       readonly event: TEvent;
       readonly receipt?: Receipt<TSnapshot>;
     }
-  | { readonly kind: 'actionFailure'; readonly error: unknown };
+  | { readonly kind: 'actionFailure'; readonly error: unknown }
+  | { readonly kind: 'checkpoint'; readonly receipt: CheckpointReceipt };
 
 const symbolObservable: typeof Symbol.observable = (() =>
   (typeof Symbol === 'function' && Symbol.observable) ||
@@ -91,6 +97,8 @@ export class EffectActor<TLogic extends AnyActorLogic> implements ActorRef<
   >();
   private _settled = false;
   private readonly _pending = new Set<Receipt<SnapshotFrom<TLogic>>>();
+  private readonly _checkpoints = new Set<CheckpointReceipt>();
+  private _checkpointState: 'running' | 'done' | 'stopped' = 'running';
 
   constructor(
     readonly logic: TLogic,
@@ -114,6 +122,7 @@ export class EffectActor<TLogic extends AnyActorLogic> implements ActorRef<
     return this._snapshot;
   }
 
+  /** Reads immediately; use `checkpoint` to include queued child replies. */
   getPersistedSnapshot(): PersistedSnapshotOf<TLogic> {
     return this.logic.getPersistedSnapshot(
       this._snapshot as never
@@ -151,6 +160,65 @@ export class EffectActor<TLogic extends AnyActorLogic> implements ActorRef<
     });
   }
 
+  /** @internal */
+  _checkpoint(
+    encode: (snapshot: PersistedSnapshotOf<TLogic>) => string
+  ): Effect.Effect<string, ActorStoppedError | Cause.UnknownError> {
+    return Effect.callback((resume) => {
+      if (
+        this._checkpointState === 'stopped' ||
+        (this._settled &&
+          (this._snapshot as Snapshot<unknown>).status !== 'done')
+      ) {
+        resume(Effect.fail(this._stoppedError()));
+        return;
+      }
+      const receipt: CheckpointReceipt = {
+        capture: () => {
+          if (!this._checkpoints.delete(receipt)) return;
+          receipt.capture = undefined;
+          receipt.reject = undefined;
+          try {
+            const result = encode(this.getPersistedSnapshot());
+            if (typeof result !== 'string') {
+              throw new TypeError(
+                'Checkpoint encoder must synchronously return a string'
+              );
+            }
+            resume(Effect.succeed(result));
+          } catch (error) {
+            resume(Effect.fail(new Cause.UnknownError(error)));
+          }
+        },
+        reject: () => {
+          if (this._checkpoints.delete(receipt)) {
+            receipt.capture = undefined;
+            receipt.reject = undefined;
+            resume(Effect.fail(this._stoppedError()));
+          }
+        }
+      };
+      this._checkpoints.add(receipt);
+      if (this._checkpointState === 'done') {
+        receipt.capture?.();
+      } else {
+        Queue.offerUnsafe(this._mailbox, { kind: 'checkpoint', receipt });
+      }
+      return Effect.sync(() => {
+        this._checkpoints.delete(receipt);
+        receipt.capture = undefined;
+        receipt.reject = undefined;
+      });
+    });
+  }
+
+  /** @internal */
+  _finishCheckpoints(): void {
+    if (this._checkpointState === 'stopped') return;
+    this._checkpointState = 'done';
+    for (const receipt of this._checkpoints) receipt.capture?.();
+  }
+
   private _deliveryError(
     event: EventFromLogic<TLogic>
   ): ActorStoppedError | EventRejectedError | undefined {
@@ -174,6 +242,8 @@ export class EffectActor<TLogic extends AnyActorLogic> implements ActorRef<
 
   /** @internal */
   _rejectReceipts(): void {
+    this._checkpointState = 'stopped';
+    for (const receipt of this._checkpoints) receipt.reject?.();
     for (const receipt of this._pending)
       this._completeReceipt(receipt, Exit.fail(this._stoppedError()));
   }
@@ -326,6 +396,9 @@ export class EffectActor<TLogic extends AnyActorLogic> implements ActorRef<
     }
     this._snapshot = snapshot;
     this._settled = true;
+    if ((snapshot as Snapshot<unknown>).status !== 'done') {
+      for (const receipt of this._checkpoints) receipt.reject?.();
+    }
     for (const receipt of this._pending) {
       if (receipt !== processing)
         this._completeReceipt(receipt, Exit.fail(this._stoppedError()));

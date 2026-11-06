@@ -1,5 +1,9 @@
 import { Effect, Schema } from 'effect';
-import { createEffectActor, createSnapshotCodec } from '@xstate/effect';
+import {
+  checkpoint,
+  createEffectActor,
+  createSnapshotCodec
+} from '@xstate/effect';
 import { createMachine } from 'xstate';
 
 const review = createMachine({
@@ -30,7 +34,9 @@ const codec = createSnapshotCodec(review, Snapshot);
 
 const program = Effect.gen(function* () {
   const actor = yield* createEffectActor(review);
-  const json = yield* codec.encode(actor.getPersistedSnapshot());
+  const json = yield* checkpoint(actor, (snapshot) =>
+    Effect.runSync(codec.encode(snapshot))
+  );
   const snapshot = yield* codec.decode(json);
   const restored = yield* createEffectActor(review, { snapshot });
   const context = restored.getSnapshot().context;

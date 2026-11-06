@@ -175,6 +175,7 @@ The actor's later errors are observed through `join` or snapshots. Invalid input
 | --- | --- |
 | `send` | Enqueue an event. |
 | `snapshots` | Stream the current snapshot and changes. |
+| `checkpoint` | Synchronously encode persisted state after queued events and immediate effects. |
 | `waitFor` | Await a snapshot predicate, optionally with a timeout. |
 | `join` | Await final output or failure. |
 | `emitted` | Stream notifications emitted by the actor. |
@@ -273,7 +274,7 @@ See [atoms and React](docs/atoms-and-react.md) for complete examples with import
 - Timed waits fail with Effect's `Cause.TimeoutError`.
 - `join` replays the original Cause and preserves a task's typed failure. Unexpected machine errors have type `unknown`.
 
-See [testing and errors](docs/testing-and-errors.md) for executable deadline, retry and failure examples. Persisted snapshots record actor state; pass one to `createEffectActor(logic, { snapshot })` to resume the actor. Use `createSnapshotCodec` with a full bidirectional Effect schema for validated JSON persistence of versioned machines. See [persisting and restoring](docs/actors.md#persisting-and-restoring).
+See [testing and errors](docs/testing-and-errors.md) for executable deadline, retry and failure examples. Use `checkpoint(actor, encode)` to capture persisted state after queued events and their immediate effects, including child replies. Decode the string and pass the snapshot to `createEffectActor(logic, { snapshot })` to resume the actor. Use `createSnapshotCodec` with a full bidirectional Effect schema for validated JSON persistence of versioned machines. See [persisting and restoring](docs/actors.md#persisting-and-restoring).
 
 ## Tracing
 

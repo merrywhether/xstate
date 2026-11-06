@@ -154,14 +154,13 @@ Timers are interrupted when the actor stops.
 
 ## Persisting and restoring
 
-An actor can outlive its process. Save `actor.getPersistedSnapshot()` after an event, then pass the saved snapshot to `createEffectActor` when the next event arrives, in the same process or another one.
+An actor can outlive its process. Use `checkpoint(actor, encode)` to encode its persisted snapshot after the interpreter has processed queued events and their immediate effects. Decode the saved string and pass the snapshot to `createEffectActor` to resume, in the same process or another one.
 
 <!-- example from examples/effect-workflows/src/persistence.ts -->
 
 ```ts
 import { Effect } from 'effect';
-import { createEffectActor } from '@xstate/effect';
-import { sendAndAwait } from '@xstate/effect/test';
+import { checkpoint, createEffectActor } from '@xstate/effect';
 import { createMachine, type Snapshot } from 'xstate';
 
 const review = createMachine({
@@ -182,8 +181,10 @@ const handle = (
   Effect.scoped(
     Effect.gen(function* () {
       const actor = yield* createEffectActor(review, { snapshot: stored });
-      yield* sendAndAwait(actor, event);
-      return JSON.parse(JSON.stringify(actor.getPersistedSnapshot()));
+      actor.send(event);
+      return JSON.parse(
+        yield* checkpoint(actor, JSON.stringify)
+      ) as Snapshot<unknown>;
     })
   );
 
@@ -197,6 +198,14 @@ const program = Effect.gen(function* () {
 export const result = await Effect.runPromise(program);
 console.log(result); // 'done'
 ```
+
+`getPersistedSnapshot()` reads the current tree immediately. It does not include queued messages. A child can already be done while its parent has not processed the completion notification; saving that intermediate snapshot can lose the notification on restore. `sendAndAwait` acknowledges one event, not the child replies it causes. `checkpoint` processes those immediate handoffs before encoding.
+
+The encoder must synchronously return a string, without sending events or mutating actors. Encoding runs in the same JavaScript turn as the mailbox check, so child snapshots cannot change while the encoder reads them. The string is detached from the live tree; the encoder owns serialization fidelity. `JSON.stringify` suits the plain data in this example. Use a reversible schema for richer values.
+
+A checkpoint does not wait for running tasks, streams, background actions, future timers or asynchronous cleanup. A completed actor can be checkpointed after its final immediate effects; stopped and errored actors fail with `ActorStoppedError`. Encoder exceptions and non-string results fail with `Cause.UnknownError`. Interrupting a checkpoint cancels its capture without stopping the actor. Continuous message production can delay capture indefinitely; use an Effect timeout to fail the request rather than force an intermediate snapshot.
+
+When commands and checkpoints share a database transaction, serialize command delivery, checkpointing and the consumed-command commit. A checkpoint can include events sent after the request while it drains the mailbox.
 
 Restoring resumes the persisted state and context without running entry actions again.
 
@@ -215,7 +224,11 @@ Restoring resumes the persisted state and context without running entry actions 
 
 ```ts
 import { Effect, Schema } from 'effect';
-import { createEffectActor, createSnapshotCodec } from '@xstate/effect';
+import {
+  checkpoint,
+  createEffectActor,
+  createSnapshotCodec
+} from '@xstate/effect';
 import { createMachine } from 'xstate';
 
 const review = createMachine({
@@ -246,7 +259,9 @@ const codec = createSnapshotCodec(review, Snapshot);
 
 const program = Effect.gen(function* () {
   const actor = yield* createEffectActor(review);
-  const json = yield* codec.encode(actor.getPersistedSnapshot());
+  const json = yield* checkpoint(actor, (snapshot) =>
+    Effect.runSync(codec.encode(snapshot))
+  );
   const snapshot = yield* codec.decode(json);
   const restored = yield* createEffectActor(review, { snapshot });
   const context = restored.getSnapshot().context;
@@ -266,6 +281,8 @@ console.log(result); // { submittedAt: '2026-01-01T00:00:00.000Z', amount: '42' 
 - Encoded values must be lossless plain JSON. Undefined, nonfinite numbers, negative zero, cycles, holes, functions, symbols, accessor properties and unsupported object prototypes are rejected. Schema validation errors retain `Schema.SchemaError` and the schema's service requirements.
 - Errored snapshots, including failed embedded children, are rejected. Recover or project their outcome before persisting. JSON cannot preserve a live Effect Cause or the genuine `EffectFailure` brand; direct restoration of a serialized failed task or stream is rejected too.
 - Decoding does not run migrations or start actors. Use the existing `machineVersions(...).migrateSnapshot` before restoration, or the machine's configured `migrate` during restoration. Choose one migration owner. Decoding a historical snapshot alone does not prove its restoration will succeed.
+
+The example's codec is synchronous and needs no services, so `Effect.runSync(codec.encode(snapshot))` can run inside the checkpoint encoder. An asynchronous codec cannot run there. `createSnapshotCodec` validates and encodes snapshots; it does not coordinate a live actor's mailbox on its own.
 
 A caller schema can still discard application data inside context or output. Verify its round trips for your domain. The codec checks transport and persistence metadata; it cannot prove arbitrary user transformations reversible.
 

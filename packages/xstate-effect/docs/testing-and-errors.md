@@ -7,7 +7,7 @@ Test the workflow with its real machine and provide local Effect services. Use `
 
 ## Acknowledging an event
 
-Import `sendAndAwait` from `@xstate/effect/test` when a test must know that one particular send was processed. The persistence example also uses it to checkpoint after each request.
+Import `sendAndAwait` from `@xstate/effect/test` when a test must know that one particular send was processed. Use `checkpoint` from `@xstate/effect` when a persisted snapshot must include queued child replies; see [persisting and restoring](actors.md#persisting-and-restoring).
 
 It returns that mailbox item's snapshot after publication and immediate effect scheduling. Ignored events succeed with an unchanged snapshot. Concurrent sends of the same object get independent receipts. An event that completes or errors the actor returns its terminal snapshot; use `join` for its outcome.
 

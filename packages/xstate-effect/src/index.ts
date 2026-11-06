@@ -18,6 +18,7 @@ export {
 export { EffectActor } from './effectActor.ts';
 export { ActorScope, withActorScope } from './actorScope.ts';
 export {
+  checkpoint,
   deadLetters,
   emitted,
   inspect,
