@@ -273,7 +273,7 @@ See [atoms and React](docs/atoms-and-react.md) for complete examples with import
 - Timed waits fail with Effect's `Cause.TimeoutError`.
 - `join` replays the original Cause and preserves a task's typed failure. Unexpected machine errors have type `unknown`.
 
-See [testing and errors](docs/testing-and-errors.md) for executable deadline, retry and failure examples. Persisted snapshots record actor state; pass one to `createEffectActor(logic, { snapshot })` to resume the actor. Use `createSnapshotCodec` with a full bidirectional Effect schema for validated JSON persistence of versioned machines. See [persisting and restoring](docs/actors.md#persisting-and-restoring).
+See [testing and errors](docs/testing-and-errors.md) for executable deadline, retry and failure examples. Persisted snapshots record actor state, pending messages and unfinished transition effects; pass one to `createEffectActor(logic, { snapshot })` to resume the actor. Use `createSnapshotCodec` with a full bidirectional Effect schema for validated JSON persistence of versioned machines. See [persisting and restoring](docs/actors.md#persisting-and-restoring).
 
 ## Tracing
 

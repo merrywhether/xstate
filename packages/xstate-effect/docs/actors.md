@@ -154,22 +154,30 @@ Timers are interrupted when the actor stops.
 
 ## Persisting and restoring
 
-An actor can outlive its process. Save `actor.getPersistedSnapshot()` after an event, then pass the saved snapshot to `createEffectActor` when the next event arrives, in the same process or another one.
+An actor can outlive its process. Save `actor.getPersistedSnapshot()` after an event, then pass the saved snapshot to `createEffectActor` in a later scope or process.
 
 <!-- example from examples/effect-workflows/src/persistence.ts -->
 
 ```ts
 import { Effect } from 'effect';
-import { createEffectActor } from '@xstate/effect';
+import { createEffectActor, waitFor } from '@xstate/effect';
 import { sendAndAwait } from '@xstate/effect/test';
-import { createMachine, type Snapshot } from 'xstate';
+import { setup, type Snapshot } from 'xstate';
+import { createAsyncLogic } from 'xstate/actors';
 
-const review = createMachine({
+const review = setup({
+  actors: {
+    finalizeReview: createAsyncLogic({ run: () => Promise.resolve() })
+  }
+}).createMachine({
   id: 'review',
   initial: 'draft',
   states: {
     draft: { on: { SUBMIT: { target: 'inReview' } } },
-    inReview: { on: { APPROVE: { target: 'approved' } } },
+    inReview: { on: { APPROVE: { target: 'finalizing' } } },
+    finalizing: {
+      invoke: { src: 'finalizeReview', onDone: { target: 'approved' } }
+    },
     approved: { type: 'final' }
   }
 });
@@ -190,22 +198,36 @@ const handle = (
 const program = Effect.gen(function* () {
   const submitted = yield* handle(undefined, { type: 'SUBMIT' });
   // Store `submitted` in a database row or a Durable Object, possibly for days.
-  const approved = yield* handle(submitted, { type: 'APPROVE' });
+  const finalizing = yield* handle(submitted, { type: 'APPROVE' });
+  // Resume pending work without resending APPROVE.
+  const restored = yield* createEffectActor(review, { snapshot: finalizing });
+  const approved = yield* waitFor(
+    restored,
+    (snapshot) => snapshot.status === 'done'
+  );
   return approved.status;
 });
 
-export const result = await Effect.runPromise(program);
+export const result = await Effect.runPromise(Effect.scoped(program));
 console.log(result); // 'done'
 ```
 
+The finalizing snapshot can contain the invocation's queued completion. Restoring finishes the review without resending `APPROVE`; `waitFor` observes the result after restoration.
+
 Restoring resumes the persisted state and context without running entry actions again.
 
-- A pending `after` transition or delayed send keeps its original deadline, measured on Effect's `Clock`. A deadline that passed while the snapshot was stored fires as soon as the actor starts.
-- State-machine children resume their persisted state and context.
-- Completed children do not restart.
+- Queued actor events resume in mailbox order, including child completion notifications. Capture does not require a processing receipt or an idle tree.
+- Unfinished transition effects resume with their captured arguments, without rerunning their originating transitions.
+- An armed `after` transition or delayed send keeps its original deadline, measured on Effect's `Clock`. A deadline that passed while the snapshot was stored fires as soon as the actor starts. A schedule not yet accepted starts with its declared delay.
+- State-machine children resume their persisted state, context and queued work.
+- Completed children do not restart. Their pending completion notifications still reach the parent.
 - Running Effect tasks and streams restart from the beginning: a `createEffectLogic` task runs its Effect again, and a `createEffectStreamLogic` or `createEffectEventStreamLogic` stream starts again from its first item. A half-finished Effect cannot be persisted, so this matches how XState restarts running async and callback actors. Make that work safe to repeat, for example with an idempotency key.
 - A snapshot-only restore does not need `input`, even when the logic requires it.
 - The restored actor belongs to the enclosing scope like any other: closing the scope stops it, its children and its timers.
+
+Pending custom actions must be registered with `setup` or `setupEffect`; unsupported captures cause the getter to throw. Restore pending mailbox work with the runtime that captured it. See [unfinished immediate work](../../../docs/persistence.md#unfinished-immediate-work) for capture restrictions and storage compatibility.
+
+A running background action body is not saved. Use an invoked task for restartable work.
 
 ## Validated JSON snapshots
 
@@ -266,6 +288,8 @@ console.log(result); // { submittedAt: '2026-01-01T00:00:00.000Z', amount: '42' 
 - Encoded values must be lossless plain JSON. Undefined, nonfinite numbers, negative zero, cycles, holes, functions, symbols, accessor properties and unsupported object prototypes are rejected. Schema validation errors retain `Schema.SchemaError` and the schema's service requirements.
 - Errored snapshots, including failed embedded children, are rejected. Recover or project their outcome before persisting. JSON cannot preserve a live Effect Cause or the genuine `EffectFailure` brand; direct restoration of a serialized failed task or stream is rejected too.
 - Decoding does not run migrations or start actors. Use the existing `machineVersions(...).migrateSnapshot` before restoration, or the machine's configured `migrate` during restoration. Choose one migration owner. Decoding a historical snapshot alone does not prove its restoration will succeed.
+
+Recovery metadata is preserved through the codec even when the supplied schema does not declare it, including nested child recovery state. An explicitly changed recovery field is rejected.
 
 A caller schema can still discard application data inside context or output. Verify its round trips for your domain. The codec checks transport and persistence metadata; it cannot prove arbitrary user transformations reversible.
 

@@ -29,6 +29,24 @@ export type MailboxItem<TEvent, TSnapshot> =
     }
   | { readonly kind: 'actionFailure'; readonly error: unknown };
 
+export type PersistedMailboxItem =
+  | { kind: 'event'; event: unknown }
+  | { kind: 'actionFailure'; error: unknown };
+
+export function restoreMailboxItem<TEvent, TSnapshot>(
+  item: PersistedMailboxItem,
+  restoreValue: (value: unknown) => unknown
+): MailboxItem<TEvent, TSnapshot> {
+  switch (item.kind) {
+    case 'event':
+      return { kind: 'event', event: restoreValue(item.event) as TEvent };
+    case 'actionFailure':
+      return { kind: 'actionFailure', error: restoreValue(item.error) };
+    default:
+      throw new Error('Invalid persisted mailbox item.');
+  }
+}
+
 const symbolObservable: typeof Symbol.observable = (() =>
   (typeof Symbol === 'function' && Symbol.observable) ||
   '@@observable')() as any;
@@ -99,6 +117,28 @@ export class EffectActor<TLogic extends AnyActorLogic> implements ActorRef<
     private readonly _mailbox: Queue.Queue<
       MailboxItem<EventFromLogic<TLogic>, SnapshotFrom<TLogic>>
     >,
+    private readonly _mailboxItems: Set<
+      MailboxItem<EventFromLogic<TLogic>, SnapshotFrom<TLogic>>
+    >,
+    private readonly _persistSnapshot: (
+      snapshot: SnapshotFrom<TLogic>
+    ) => PersistedSnapshotOf<TLogic>,
+    private readonly _restoreLifecycleEvent: (
+      event: EventFromLogic<TLogic>,
+      capturedChildSession: string | undefined,
+      snapshot: SnapshotFrom<TLogic>
+    ) => EventFromLogic<TLogic> | undefined,
+    private readonly _addRecovery: (
+      snapshot: PersistedSnapshotOf<TLogic>,
+      fields: {
+        effectMailbox: PersistedMailboxItem[];
+        effectSessions: Record<string, string | undefined>;
+      }
+    ) => PersistedSnapshotOf<TLogic>,
+    private readonly _persistValue: (
+      value: unknown,
+      snapshot: SnapshotFrom<TLogic>
+    ) => unknown,
     private readonly _stopExecution: () => void,
     private readonly _inspectors: Set<(event: InspectionEvent) => void>
   ) {
@@ -115,15 +155,52 @@ export class EffectActor<TLogic extends AnyActorLogic> implements ActorRef<
   }
 
   getPersistedSnapshot(): PersistedSnapshotOf<TLogic> {
-    return this.logic.getPersistedSnapshot(
-      this._snapshot as never
-    ) as PersistedSnapshotOf<TLogic>;
+    const children =
+      (this._snapshot as { children?: Record<string, AnyActor | undefined> })
+        .children ?? {};
+    const events: PersistedMailboxItem[] = (
+      (this._snapshot as Snapshot<unknown>).status === 'active'
+        ? [...this._mailboxItems]
+        : []
+    ).flatMap((item): PersistedMailboxItem[] => {
+      if (item.kind === 'actionFailure')
+        return [
+          {
+            kind: 'actionFailure',
+            error: this._persistValue(item.error, this._snapshot)
+          }
+        ];
+      const actorId = (item.event as { actorId?: unknown }).actorId;
+      const event = this._restoreLifecycleEvent(
+        item.event,
+        typeof actorId === 'string' ? children[actorId]?.sessionId : undefined,
+        this._snapshot
+      );
+      return event === undefined
+        ? []
+        : [
+            {
+              kind: 'event',
+              event: this._persistValue(event, this._snapshot)
+            }
+          ];
+    });
+    const persisted = this._persistSnapshot(this._snapshot);
+    if (!events.length) return persisted;
+    return this._addRecovery(persisted, {
+      effectSessions: Object.fromEntries(
+        Object.entries(children).map(([id, child]) => [id, child?.sessionId])
+      ),
+      effectMailbox: events
+    });
   }
 
   /** Sends an event; the actor processes it on its own fiber. */
   send(event: EventFromLogic<TLogic>): void {
     if (this._deliveryError(event)) return;
-    Queue.offerUnsafe(this._mailbox, { kind: 'event', event });
+    const item = { kind: 'event' as const, event };
+    this._mailboxItems.add(item);
+    Queue.offerUnsafe(this._mailbox, item);
   }
 
   /** @internal */
@@ -143,7 +220,9 @@ export class EffectActor<TLogic extends AnyActorLogic> implements ActorRef<
         resume: (exit) => resume(exit)
       };
       this._pending.add(receipt);
-      Queue.offerUnsafe(this._mailbox, { kind: 'event', event, receipt });
+      const item = { kind: 'event' as const, event, receipt };
+      this._mailboxItems.add(item);
+      Queue.offerUnsafe(this._mailbox, item);
       return Effect.sync(() => {
         this._pending.delete(receipt);
         receipt.resume = undefined;

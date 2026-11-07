@@ -199,6 +199,32 @@ function sameData(left: unknown, right: unknown): boolean {
   return false;
 }
 
+function preserveRecoveryMetadata(before: unknown, after: unknown): unknown {
+  if (!record(before) || !record(after)) return after;
+  let result = after;
+  if (
+    Object.hasOwn(before, '_xstateRecovery') &&
+    !Object.hasOwn(after, '_xstateRecovery')
+  ) {
+    result = { ...result, _xstateRecovery: before._xstateRecovery };
+  }
+  if (record(before.children) && record(after.children)) {
+    let children = after.children;
+    for (const [id, child] of Object.entries(before.children)) {
+      const encoded = after.children[id];
+      if (!record(child) || !record(encoded)) continue;
+      const snapshot = preserveRecoveryMetadata(
+        child.snapshot,
+        encoded.snapshot
+      );
+      if (snapshot !== encoded.snapshot)
+        children = { ...children, [id]: { ...encoded, snapshot } };
+    }
+    if (children !== after.children) result = { ...result, children };
+  }
+  return result;
+}
+
 function checkMetadata(
   before: Record<string, unknown>,
   after: Record<string, unknown>,
@@ -320,8 +346,9 @@ export function createSnapshotCodec<
         yield* checked('encode', () =>
           checkSnapshot(snapshot, 'encode', '$.snapshot', machine.id)
         );
-        const encoded = yield* Schema.encodeUnknownEffect(schema)(snapshot);
+        const transformed = yield* Schema.encodeUnknownEffect(schema)(snapshot);
         return yield* checked('encode', () => {
+          const encoded = preserveRecoveryMetadata(snapshot, transformed);
           checkJson(encoded, 'encode');
           checkSnapshot(encoded, 'encode', '$.snapshot', machine.id);
           checkMetadata(snapshot, encoded, 'encode');
@@ -356,7 +383,8 @@ export function createSnapshotCodec<
           checkSnapshot(envelope.snapshot, 'decode', '$.snapshot', machine.id);
           return envelope.snapshot;
         });
-        const snapshot = yield* Schema.decodeUnknownEffect(schema)(encoded);
+        const transformed = yield* Schema.decodeUnknownEffect(schema)(encoded);
+        const snapshot = preserveRecoveryMetadata(encoded, transformed);
         yield* checked('decode', () => {
           checkSnapshot(snapshot, 'decode', '$.snapshot', machine.id);
           checkMetadata(encoded, snapshot, 'decode');

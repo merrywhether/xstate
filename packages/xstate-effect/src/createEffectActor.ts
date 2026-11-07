@@ -13,12 +13,14 @@ import {
   isMachineSnapshot,
   stopActor,
   terminateActor,
+  type Actor,
   type AnyActor,
   type AnyActorLogic,
   type AnyEventObject,
   type EventFromLogic,
   type InspectionEvent,
   type InputFrom,
+  type PersistedSnapshotOf,
   type RestorablePersistedSnapshotFor,
   type RequiredActorOptionsKeys,
   type Snapshot,
@@ -26,7 +28,13 @@ import {
   type TimerKey
 } from 'xstate';
 import { createDurable, type DurableEffect } from 'xstate/durable';
-import { EffectActor, safeCall, type MailboxItem } from './effectActor.ts';
+import {
+  EffectActor,
+  safeCall,
+  restoreMailboxItem,
+  type PersistedMailboxItem,
+  type MailboxItem
+} from './effectActor.ts';
 import {
   bindEffectHost,
   closeEffectHost,
@@ -117,6 +125,9 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
         yield* Queue.unbounded<
           MailboxItem<EventFromLogic<TLogic>, SnapshotFrom<TLogic>>
         >();
+      const mailboxItems = new Set<
+        MailboxItem<EventFromLogic<TLogic>, SnapshotFrom<TLogic>>
+      >();
       let delivered:
         | MailboxItem<EventFromLogic<TLogic>, SnapshotFrom<TLogic>>
         | undefined;
@@ -132,6 +143,7 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
         item: MailboxItem<EventFromLogic<TLogic>, SnapshotFrom<TLogic>>
       ) => {
         if (!stopped) {
+          mailboxItems.add(item);
           Queue.offerUnsafe(mailbox, item);
         }
       };
@@ -318,8 +330,57 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
       // any send. Restoring runs no entry actions; its effects resume
       // machine children, restart running Effect children and re-arm pending
       // timers.
-      let [snapshot, effects] = options?.snapshot
-        ? durable.restore(options.snapshot)
+      const rawRecovery = (
+        options?.snapshot as { _xstateRecovery?: unknown } | undefined
+      )?._xstateRecovery;
+      const recovery =
+        rawRecovery &&
+        typeof rawRecovery === 'object' &&
+        !Array.isArray(rawRecovery) &&
+        (rawRecovery as { type?: unknown }).type === 'xstate.recovery'
+          ? (rawRecovery as {
+              version: unknown;
+              effectMailbox?: PersistedMailboxItem[];
+              effectSessions?: Record<string, string | undefined>;
+            })
+          : undefined;
+      if (
+        recovery &&
+        (recovery.version !== 1 ||
+          (recovery.effectMailbox !== undefined &&
+            !Array.isArray(recovery.effectMailbox)) ||
+          (recovery.effectSessions !== undefined &&
+            (!recovery.effectSessions ||
+              typeof recovery.effectSessions !== 'object' ||
+              Array.isArray(recovery.effectSessions) ||
+              Object.values(recovery.effectSessions).some(
+                (session) =>
+                  session !== undefined && typeof session !== 'string'
+              ))))
+      )
+        throw new Error('Invalid recovery metadata.');
+      if (
+        recovery &&
+        ((recovery as { mailbox?: unknown[] }).mailbox?.length ||
+          (recovery as { durableMailbox?: unknown[] }).durableMailbox?.length)
+      ) {
+        throw new Error(
+          'Cannot restore another runtime’s pending mailbox in an Effect actor.'
+        );
+      }
+      const restoreSnapshot =
+        options?.snapshot && recovery
+          ? {
+              ...options.snapshot,
+              _xstateRecovery: {
+                ...recovery,
+                effectMailbox: undefined,
+                effectSessions: undefined
+              }
+            }
+          : options?.snapshot;
+      let [snapshot, effects] = restoreSnapshot
+        ? durable.restore(restoreSnapshot)
         : durable.initialTransition(options?.input as never);
       const initial: Snapshot<unknown> = snapshot;
       if (
@@ -350,10 +411,62 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
         root!,
         snapshot,
         mailbox,
+        mailboxItems,
+        (current) => {
+          const native = durable.getActorRef(current) as
+            | Actor<TLogic>
+            | undefined;
+          return native
+            ? native.getPersistedSnapshot()
+            : (logic.getPersistedSnapshot(
+                current as never
+              ) as PersistedSnapshotOf<TLogic>);
+        },
+        (event, capturedChildSession, current) =>
+          (
+            durable.getActorRef(current) as Actor<TLogic>
+          )._restoreLifecycleEvent(event, capturedChildSession),
+        (persisted, fields) =>
+          (durable.getActorRef(snapshot) as Actor<TLogic>)._addRecoveryMetadata(
+            persisted,
+            fields
+          ),
+        (value, current) =>
+          (durable.getActorRef(current) as Actor<TLogic>)._persistEffectValue(
+            value
+          ),
         stop,
         inspectors
       );
       bindEffectHost(actor, host);
+      for (const saved of recovery?.effectMailbox ?? []) {
+        const item = restoreMailboxItem<
+          EventFromLogic<TLogic>,
+          SnapshotFrom<TLogic>
+        >(saved, (value) =>
+          (durable.getActorRef(snapshot) as Actor<TLogic>)._restoreEffectValue(
+            value
+          )
+        );
+        if (item.kind === 'actionFailure') {
+          offer(item);
+          continue;
+        }
+        const event = item.event;
+        const internal = event as AnyEventObject & {
+          actorId?: string;
+          sessionId?: string;
+        };
+        const recovered = (
+          durable.getActorRef(snapshot) as Actor<TLogic>
+        )._restoreLifecycleEvent(
+          event,
+          internal.actorId === undefined
+            ? undefined
+            : recovery?.effectSessions?.[internal.actorId]
+        );
+        if (recovered !== undefined) offer({ kind: 'event', event: recovered });
+      }
 
       const executeEffects = (
         batch: DurableEffect<any>[]
@@ -395,6 +508,7 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
             ).getExecutionErrorEvent?.(snapshot, item.error);
             if (!errorEvent) {
               snapshot = errorSnapshot(snapshot, item.error);
+              mailboxItems.delete(item);
               break;
             }
             event = errorEvent;
@@ -405,10 +519,12 @@ export function createEffectActor<TLogic extends AnyActorLogic>(
             [snapshot, effects] = durable.transition(snapshot, event);
           } catch (error) {
             snapshot = errorSnapshot(snapshot, error);
+            mailboxItems.delete(item);
             actor._publish(snapshot, receipt);
             actor._completeReceipt(receipt, Exit.succeed(snapshot));
             break;
           }
+          mailboxItems.delete(item);
           actor._publish(snapshot, receipt);
           if (stopped) break;
           const rejectedReason =
