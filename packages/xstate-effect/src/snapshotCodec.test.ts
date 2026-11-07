@@ -1,10 +1,13 @@
-import { Context, Effect, Schema } from 'effect';
+import { Context, Duration, Effect, Schema } from 'effect';
 import { createActor, createMachine, machineVersions } from 'xstate';
+import type { PersistedSnapshotOf } from 'xstate';
 import {
   createEffectActor,
   createSnapshotCodec,
-  SnapshotCodecError
+  SnapshotCodecError,
+  waitFor
 } from './index.ts';
+import { sendAndAwait } from './test.ts';
 
 const machine = createMachine({
   id: 'counter',
@@ -433,6 +436,123 @@ it('restores inline machine children whose native descriptors omit src', async (
         expect(
           Object.values(restored.getSnapshot().children)[0]?.getSnapshot().value
         ).toBe('waiting');
+      })
+    )
+  );
+});
+
+it('preserves queued root events through a schema that omits recovery metadata', async () => {
+  const logic = createMachine({
+    id: 'counter',
+    version: '2',
+    context: { count: 0 },
+    initial: 'idle',
+    states: { idle: {} },
+    on: {
+      PING: {},
+      INC: ({ context }) => ({ context: { count: context.count + 1 } })
+    }
+  });
+  const strict = createSnapshotCodec(logic, Schema.Struct(fields));
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const original = yield* createEffectActor(logic);
+        yield* sendAndAwait(original, { type: 'PING' });
+        original.send({ type: 'INC' });
+        const json = yield* strict.encode(original.getPersistedSnapshot());
+        const snapshot = yield* strict.decode(json);
+        const restored = yield* createEffectActor(logic, { snapshot });
+        yield* waitFor(restored, (s) => s.context.count === 1, {
+          timeout: Duration.seconds(1)
+        });
+        expect(restored.getSnapshot().context.count).toBe(1);
+      })
+    )
+  );
+});
+
+it('preserves nested child and root continuations through strict snapshot schemas', async () => {
+  const child = createMachine({
+    id: 'child',
+    version: '1',
+    context: { count: 0 },
+    initial: 'ready',
+    states: { ready: {} },
+    on: {
+      INC: ({ context, parent }, enq) => {
+        enq.sendTo(parent!, { type: 'REPORT' });
+        return { context: { count: context.count + 1 } };
+      }
+    }
+  });
+  const logic = createMachine({
+    id: 'counter',
+    version: '2',
+    actors: { child },
+    context: { count: 0 },
+    initial: 'idle',
+    states: { idle: { invoke: { src: 'child', id: 'child' } } },
+    on: {
+      PING: {},
+      GO: ({ children }, enq) => {
+        enq.sendTo(children.child!, { type: 'INC' });
+        enq.sendTo(children.child!, { type: 'INC' });
+      },
+      REPORT: ({ context }) => ({ context: { count: context.count + 1 } })
+    }
+  });
+  const childSchema = Schema.Struct({
+    ...fields,
+    machine: Schema.Struct({
+      id: Schema.Literal('child'),
+      version: Schema.Literal('1')
+    })
+  });
+  const strict = createSnapshotCodec(
+    logic,
+    Schema.Struct({
+      ...fields,
+      children: Schema.Record(
+        Schema.String,
+        Schema.Struct({
+          src: Schema.String,
+          address: Schema.String,
+          syncSnapshot: Schema.optionalKey(Schema.Boolean),
+          snapshot: childSchema
+        })
+      )
+    })
+  );
+  let snapshot: PersistedSnapshotOf<typeof logic> | undefined;
+  let captureError: unknown;
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const original = yield* createEffectActor(logic);
+        yield* sendAndAwait(original, { type: 'PING' });
+        original.getSnapshot().children.child!.subscribe((s) => {
+          if (s.context.count === 1 && !snapshot && !captureError) {
+            try {
+              snapshot = original.getPersistedSnapshot();
+            } catch (error) {
+              captureError = error;
+            }
+          }
+        });
+        yield* sendAndAwait(original, { type: 'GO' });
+        expect(captureError).toBeUndefined();
+        expect(snapshot).toBeDefined();
+        if (!snapshot) throw new Error('snapshot was not captured');
+        const json = yield* strict.encode(snapshot);
+        const decoded = yield* strict.decode(json);
+        const restored = yield* createEffectActor(logic, { snapshot: decoded });
+        yield* waitFor(restored, (s) => s.context.count === 2, {
+          timeout: Duration.seconds(1)
+        });
+        expect(
+          restored.getSnapshot().children.child!.getSnapshot().context.count
+        ).toBe(2);
       })
     )
   );

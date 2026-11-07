@@ -18,6 +18,7 @@ import {
   waitFor,
   type EffectActor
 } from './index.ts';
+import { sendAndAwait } from './test.ts';
 
 /** Persists like a host would: through JSON, into a different process. */
 const roundTrip = (snapshot: Snapshot<unknown>): Snapshot<unknown> =>
@@ -656,4 +657,115 @@ describe('createEffectActor with a persisted snapshot', () => {
     // @ts-expect-error -- and so does one with no options at all
     createEffectActor(machine);
   });
+});
+
+it('does not replay actions after their failure has been handled', async () => {
+  let failures = 0;
+  let tails = 0;
+  const machine = setup({
+    actions: {
+      fail: () => {
+        failures++;
+        if (failures === 1) throw new Error('failure');
+      },
+      tail: () => {
+        tails++;
+      }
+    }
+  }).createMachine({
+    initial: 'active',
+    states: {
+      active: {
+        on: {
+          GO: ({ actions }, enq) => {
+            enq(actions.fail);
+            enq(actions.tail);
+          },
+          PING: {}
+        },
+        onError: { target: 'recovered' }
+      },
+      recovered: { on: { PING: {} } }
+    }
+  });
+  let saved: ReturnType<typeof machine.getPersistedSnapshot> | undefined;
+  let captureError: unknown;
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const original = yield* createEffectActor(machine);
+        yield* sendAndAwait(original, { type: 'PING' });
+        original.subscribe((snapshot) => {
+          if (snapshot.matches('recovered') && !saved && !captureError) {
+            try {
+              saved = JSON.parse(
+                JSON.stringify(original.getPersistedSnapshot())
+              );
+            } catch (error) {
+              captureError = error;
+            }
+          }
+        });
+        yield* sendAndAwait(original, { type: 'GO' });
+        yield* waitFor(original, (s) => s.matches('recovered'), {
+          timeout: Duration.seconds(1)
+        });
+        expect(captureError).toBeUndefined();
+        expect(saved).toBeDefined();
+        if (!saved) throw new Error('snapshot was not captured');
+        const restored = yield* createEffectActor(machine, { snapshot: saved });
+        yield* sendAndAwait(restored, { type: 'PING' });
+        expect(restored.getSnapshot().matches('recovered')).toBe(true);
+        expect(failures).toBe(1);
+        expect(tails).toBe(1);
+      })
+    )
+  );
+});
+
+it('routes a restored pending action failure to the root error handler', async () => {
+  let failures = 0;
+  let tails = 0;
+  const machine = setup({
+    actions: {
+      fail: () => {
+        failures++;
+        throw new Error('failure');
+      },
+      tail: () => {
+        tails++;
+      }
+    }
+  }).createMachine({
+    initial: 'active',
+    states: {
+      active: {
+        entry: ({ actions }, enq) => {
+          enq(actions.fail);
+          enq(actions.tail);
+        },
+        onError: { target: 'recovered' }
+      },
+      recovered: {}
+    }
+  });
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const original = yield* createEffectActor(machine);
+        const snapshot = JSON.parse(
+          JSON.stringify(original.getPersistedSnapshot())
+        );
+        yield* waitFor(original, (s) => s.matches('recovered'), {
+          timeout: Duration.seconds(1)
+        });
+        const restored = yield* createEffectActor(machine, { snapshot });
+        yield* waitFor(restored, (s) => s.matches('recovered'), {
+          timeout: Duration.seconds(1)
+        });
+        expect(failures).toBe(2);
+        expect(tails).toBe(2);
+      })
+    )
+  );
 });
