@@ -68,7 +68,8 @@ describe('durable checkpoint restoration', () => {
       }
     });
     const fresh = createDurable(machine, adapter());
-    const [initial] = fresh.initialTransition();
+    const [initial, initialEffects] = fresh.initialTransition();
+    await fresh.executeEffects(initialEffects);
     const persisted = roundTrip(machine.getPersistedSnapshot(initial));
     check.mockClear();
     const host = adapter({ transitionIndex: 7 });
@@ -119,8 +120,8 @@ describe('durable checkpoint restoration', () => {
     );
 
     expect(run).not.toHaveBeenCalled();
-    expect(effects.map(({ id }) => id)).toEqual(['restore:0:0']);
-    expect(effects[0].descriptor).toMatchObject({
+    expect(effects.map(({ id }) => id)).toEqual(['restore:0:0', 'restore:0:1']);
+    expect(effects[1].descriptor).toMatchObject({
       type: '@xstate.start',
       actor: { $actor: 'request/worker' }
     });
@@ -349,7 +350,7 @@ describe('durable checkpoint restoration', () => {
       await execution.executeEffects(effects);
       expect(scheduleTimer).toHaveBeenCalledTimes(3);
       expect(scheduleTimer.mock.calls.map(([, , delay]) => delay)).toEqual([
-        900, 3000, 0
+        1050, 3000, 50
       ]);
 
       vi.setSystemTime(1200);
@@ -357,7 +358,7 @@ describe('durable checkpoint restoration', () => {
         effects.filter(({ effect }) => effect.type !== '@xstate.start')
       );
       expect(scheduleTimer.mock.calls.map(([, , delay]) => delay)).toEqual([
-        900, 3000, 0, 800, 2900, 0
+        1050, 3000, 50, 800, 2750, 0
       ]);
       expect(effects.map(({ id }) => id)).toEqual(ids);
       expect(effects.map(({ descriptor }) => descriptor)).toEqual(descriptors);
@@ -542,3 +543,150 @@ describe('durable checkpoint restoration', () => {
     expect(resumed.nextTransitionIndex).toBe(0);
   });
 });
+
+it('restores a captured child completion before the next host event', async () => {
+  const child = createMachine({
+    initial: 'working',
+    states: {
+      working: { on: { FINISH: { target: 'done' } } },
+      done: { type: 'final' }
+    }
+  });
+  const machine = createMachine({
+    actors: { child },
+    context: { completions: 0 },
+    invoke: {
+      src: 'child',
+      id: 'child',
+      onDone: ({ context }) => ({
+        context: { completions: context.completions + 1 }
+      })
+    },
+    on: {
+      GO: ({ children }, enq) =>
+        enq.sendTo(children.child!, { type: 'FINISH' }),
+      PING: {}
+    }
+  });
+  const fresh = createDurable(
+    machine,
+    adapter({ waitForEvent: () => ({ type: 'PING' }) })
+  );
+  let [snapshot, effects] = fresh.initialTransition();
+  await fresh.executeEffects(effects);
+  [snapshot, effects] = fresh.transition(snapshot, { type: 'GO' });
+  await fresh.executeEffects(effects);
+  const saved = roundTrip(machine.getPersistedSnapshot(snapshot));
+  const originalReply = await fresh.waitForEvent();
+  expect(originalReply).toMatchObject({
+    type: 'xstate.done.actor',
+    actorId: 'child'
+  });
+  const handedOff = roundTrip(machine.getPersistedSnapshot(snapshot));
+  const [original] = fresh.transition(snapshot, originalReply);
+  expect(original.context.completions).toBe(1);
+  for (const checkpoint of [saved, handedOff]) {
+    const resumed = createDurable(
+      machine,
+      adapter({ waitForEvent: () => ({ type: 'PING' }) })
+    );
+    const [restored, restoreEffects] = resumed.restore(checkpoint);
+    await resumed.executeEffects(restoreEffects);
+    const restoredReply = await resumed.waitForEvent();
+    expect(restoredReply).toMatchObject({
+      type: 'xstate.done.actor',
+      actorId: 'child'
+    });
+    const [afterReply] = resumed.transition(restored, restoredReply);
+    expect(afterReply.context.completions).toBe(1);
+    expect(await resumed.waitForEvent()).toEqual({ type: 'PING' });
+  }
+  const committed = roundTrip(machine.getPersistedSnapshot(original));
+  const resumedAfterCommit = createDurable(
+    machine,
+    adapter({ waitForEvent: () => ({ type: 'PING' }) })
+  );
+  const [afterCommit, effectsAfterCommit] =
+    resumedAfterCommit.restore(committed);
+  await resumedAfterCommit.executeEffects(effectsAfterCommit);
+  expect(afterCommit.context.completions).toBe(1);
+  expect(await resumedAfterCommit.waitForEvent()).toEqual({ type: 'PING' });
+});
+
+it('retains captured root replies in FIFO order across handoff and restore', async () => {
+  const child = createMachine({
+    context: { count: 0 },
+    on: {
+      INC: ({ context, parent }, enq) => {
+        const count = context.count + 1;
+        enq.sendTo(parent!, { type: count === 1 ? 'FIRST' : 'SECOND' });
+        return { context: { count } };
+      }
+    }
+  });
+  const machine = createMachine({
+    actors: { child },
+    context: { reports: [] as number[] },
+    invoke: { src: 'child', id: 'child' },
+    on: {
+      GO: ({ children }, enq) => {
+        enq.sendTo(children.child!, { type: 'INC' });
+        enq.sendTo(children.child!, { type: 'INC' });
+      },
+      FIRST: ({ context }) => ({
+        context: { reports: [...context.reports, 1] }
+      }),
+      SECOND: ({ context }) => ({
+        context: { reports: [...context.reports, 2] }
+      }),
+      PING: {}
+    }
+  });
+  const fresh = createDurable(
+    machine,
+    adapter({ waitForEvent: () => ({ type: 'PING' }) })
+  );
+  let [snapshot, effects] = fresh.initialTransition();
+  await fresh.executeEffects(effects);
+  [snapshot, effects] = fresh.transition(snapshot, { type: 'GO' });
+  await fresh.executeEffects(effects);
+  expect(await fresh.waitForEvent()).toEqual({ type: 'FIRST' });
+  const checkpoint = roundTrip(machine.getPersistedSnapshot(snapshot));
+  const resumed = createDurable(
+    machine,
+    adapter({ waitForEvent: () => ({ type: 'PING' }) })
+  );
+  let [restored, restoreEffects] = resumed.restore(checkpoint);
+  await resumed.executeEffects(restoreEffects);
+  const first = await resumed.waitForEvent();
+  expect(first).toEqual({ type: 'FIRST' });
+  [restored, restoreEffects] = resumed.transition(restored, first);
+  await resumed.executeEffects(restoreEffects);
+  const second = await resumed.waitForEvent();
+  expect(second).toEqual({ type: 'SECOND' });
+  [restored, restoreEffects] = resumed.transition(restored, second);
+  await resumed.executeEffects(restoreEffects);
+  expect(restored.context.reports).toEqual([1, 2]);
+  expect(await resumed.waitForEvent()).toEqual({ type: 'PING' });
+});
+
+it.each(['mailbox', 'effectMailbox'] as const)(
+  'rejects recovery work from the foreign %s runtime',
+  (field) => {
+    const machine = createMachine({ on: { PING: {} } });
+    const fresh = createDurable(machine, adapter());
+    const [initial] = fresh.initialTransition();
+    const checkpoint = {
+      ...machine.getPersistedSnapshot(initial),
+      _xstateRecovery: {
+        type: 'xstate.recovery',
+        version: 1,
+        [field]: [{ type: 'PING' }]
+      }
+    };
+    const resumed = createDurable(machine, adapter());
+    expect(() => resumed.restore(checkpoint)).toThrow(
+      'Pending mailbox work must be restored with its owning actor runtime.'
+    );
+  }
+);
