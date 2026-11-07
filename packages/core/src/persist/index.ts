@@ -1,3 +1,8 @@
+import {
+  readRecoveryEnvelope,
+  stripRecoveryEnvelope
+} from '../recoveryEnvelope.ts';
+import { restorePendingEffects } from '../pendingEffects.ts';
 import isDevelopment from '#is-development';
 import { Actor } from '../createActor.ts';
 import { diagnoseActorOptions } from '../devDiagnostics.ts';
@@ -104,6 +109,24 @@ export function restoreLogicSnapshot<TLogic extends AnyActorLogic>(
   persisted: unknown,
   actorScope?: AnyActorScope
 ): SnapshotFrom<TLogic> {
+  const recovery = readRecoveryEnvelope(persisted);
+  if (
+    (recovery?.effectMailbox?.length || recovery?.durableMailbox?.length) &&
+    (!actorScope || !isInertActorScope(actorScope))
+  ) {
+    throw new Error(
+      'Cannot restore another runtime’s pending mailbox in a native actor.'
+    );
+  }
+  if (recovery?.mailbox) {
+    if (
+      !actorScope ||
+      !('_restoreMailbox' in actorScope.self) ||
+      typeof actorScope.self._restoreMailbox !== 'function'
+    )
+      throw new Error('Invalid persisted actor mailbox.');
+    actorScope.self._restoreMailbox(recovery.mailbox);
+  }
   if (logic instanceof StateMachine) {
     return restoreMachineSnapshot(
       logic,
@@ -118,9 +141,18 @@ export function restoreLogicSnapshot<TLogic extends AnyActorLogic>(
       isDevelopment ? 'Persisted snapshot must be an object.' : xstateError(46)
     );
   }
+  if (recovery?.effects) {
+    if (!actorScope)
+      throw new Error('Invalid pending effects in actor snapshot.');
+    restorePendingEffects(
+      actorScope.self,
+      recovery.effects as Parameters<typeof restorePendingEffects>[1]
+    );
+  }
+  const logicSnapshot = stripRecoveryEnvelope(persisted);
   return logic.restoreSnapshot
-    ? logic.restoreSnapshot(persisted as Snapshot<unknown>, actorScope)
-    : (persisted as SnapshotFrom<TLogic>);
+    ? logic.restoreSnapshot(logicSnapshot as Snapshot<unknown>, actorScope)
+    : (logicSnapshot as SnapshotFrom<TLogic>);
 }
 
 function createRestoreHook(
@@ -503,6 +535,16 @@ export function restoreMachineSnapshot<TMachine extends AnyStateMachine>(
     machine,
     resolvedActorScope.self
   ) as AnyMachineSnapshot;
+
+  const recovery = readRecoveryEnvelope(snapshot);
+  if (recovery?.effects)
+    restorePendingEffects(
+      resolvedActorScope.self,
+      recovery.effects as Parameters<typeof restorePendingEffects>[1]
+    );
+  if (recovery)
+    delete (restoredSnapshot as unknown as Record<string, unknown>)
+      ._xstateRecovery;
 
   if (usesInertScope) {
     setInertActorScopeSnapshot(resolvedActorScope, restoredSnapshot, false);

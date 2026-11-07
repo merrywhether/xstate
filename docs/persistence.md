@@ -33,9 +33,9 @@ See [Vue input and restored snapshots](vue/input-and-snapshots.md).
 
 Pass `system` (a `createSystem()` result) to restore the actor into that system.
 
-A restored snapshot is opaque: restoring runs no transitions and re-executes no actions. `always` transitions and choice states in the restored configuration are not re-evaluated until the next event, even if their guards would now pass. Development builds warn when the restored state has eventless transitions.
+A restored snapshot is opaque: restoring does not replay committed transitions or accepted action invocations. Pending inputs and unfinished effects resume when the actor starts. `always` transitions and choice states in the restored configuration are not re-evaluated until the next event, even if their guards would now pass. Development builds warn when the restored state has eventless transitions.
 
-Restoring a terminal snapshot keeps it terminal. A snapshot with `status: 'done'`, `'error'` or `'stopped'` restores to an actor with that status after `start()`; it runs no transitions and processes no events. For `'error'`, subscribers with an `error` observer receive the persisted error, whether they subscribe before or after `start()`. A snapshot that cannot be restored, such as one that is not an object, has no valid `value`, whose `value` names a state the machine does not have, or whose children or timers are malformed, produces an actor with an `'error'` snapshot whose `error` describes the failure (an `InvalidSnapshotError` for these structural cases); `restoreActor(...)` and `start()` do not throw. A `value` that stops at a compound state, such as `{ active: {} }`, is completed with that state's initial descendants, and the restored snapshot's `value` reflects the completed configuration.
+Restoring a terminal snapshot keeps it terminal. A snapshot with `status: 'done'`, `'error'` or `'stopped'` restores to an actor with that status after `start()`; it runs no transitions and processes no events. A completed actor can still deliver an unfinished parent notification captured with its final state. For `'error'`, subscribers with an `error` observer receive the persisted error, whether they subscribe before or after `start()`. A snapshot that cannot be restored, such as one that is not an object, has no valid `value`, whose `value` names a state the machine does not have, or whose children or timers are malformed, produces an actor with an `'error'` snapshot whose `error` describes the failure (an `InvalidSnapshotError` for these structural cases); `restoreActor(...)` and `start()` do not throw. A `value` that stops at a compound state, such as `{ active: {} }`, is completed with that state's initial descendants, and the restored snapshot's `value` reflects the completed configuration.
 
 Persisted snapshots may include child actor state. Keep the actor logic compatible with snapshots already stored by your application.
 
@@ -316,3 +316,15 @@ import { restoreActor } from 'xstate/persist';
 const persisted = actor.getPersistedSnapshot();
 const restored = restoreActor(logic, persisted).start();
 ```
+
+## Unfinished immediate work
+
+`actor.getPersistedSnapshot()` records queued actor inputs and unfinished transition effects alongside actor state. Restore resumes that work against the restored actor tree. Captures can occur while a parent is waiting for a child reply or while a child's mailbox is being processed. The already-committed input is not processed again. An immediate capture after `send()` can contain that input still queued; capture does not require waiting for it to be processed.
+
+A persisted snapshot represents execution state, including unfinished work, rather than an event history. Redelivering an original input against an already-advanced state may ignore it or perform a different transition; it does not reconstruct the effects of the committed transition. A host that instead restores an earlier checkpoint and replays inputs must also handle repeated effects through idempotency or a durable journal.
+
+Pending actions must have an implementation registered in the machine's action sources. Their resolved arguments are captured; framework actor and source capabilities bind to the restored tree. Unsupported pending closures and captured values fail at persistence rather than being silently omitted. A captured local actor capability must still name the same incarnation in the saved tree. A pending operation for a retired child, including its stop during state reentry, rejects capture until that operation is accepted; it never binds to the replacement child at the same address. Active asynchronous activities keep their existing restart semantics, and external side effects still require idempotency or a durable journal.
+
+Restore pending mailbox work with the same actor runtime that captured it: a native actor, an Effect actor, or a host-driven durable execution. A different runtime rejects pending mailboxes rather than dropping them. Snapshots without pending mailboxes remain portable.
+
+Recovery bookkeeping is private snapshot data. Preserve it through storage and migrations. Older snapshots without it remain readable but cannot reconstruct work their writer omitted. Snapshots containing pending work require an updated reader; loading them into a runtime that ignores recovery metadata is unsafe.

@@ -1,3 +1,17 @@
+import {
+  registerDurableMailbox,
+  restoreDurableMailbox
+} from '../durableMailbox.ts';
+import { readRecoveryEnvelope } from '../recoveryEnvelope.ts';
+import {
+  acceptPendingEffect,
+  getExecutingPendingEffect,
+  hydratePendingEffects,
+  registerPendingDelivery,
+  hasRestoredPendingEffects,
+  setPendingEffects,
+  withPendingEffect
+} from '../pendingEffects.ts';
 import { restoreLogicSnapshot } from '../persist/index.ts';
 import { getTimerStart, recordTimerStart } from '../timerClock.ts';
 import {
@@ -12,7 +26,12 @@ import {
 } from '../inertActorScope.ts';
 import { isRemoteActorRef } from '../remoteActorRef.ts';
 import { createStartEffect, createTimerEffect } from '../transitionActions.ts';
-import { getSnapshotActorRef } from '../snapshotActorRef.ts';
+import {
+  getSnapshotActorRef,
+  getSnapshotActorRefProvider,
+  peekSnapshotActorRef,
+  setLazySnapshotActorRef
+} from '../snapshotActorRef.ts';
 import {
   encodeAddressSegment,
   withExecutionIdentity,
@@ -38,7 +57,7 @@ import type {
   SnapshotFrom,
   TimerKey
 } from '../types.ts';
-import { matchesTimerKey } from '../timerKey.ts';
+import { getTimerKey, matchesTimerKey } from '../timerKey.ts';
 
 /** @experimental */
 export interface DurableEffectMetadata {
@@ -416,6 +435,14 @@ export function createDurable<TLogic extends AnyActorLogic>(
   // Root-addressed events captured by settled batches, waiting for the drive
   // loop to take them through `waitForEvent()`.
   const pendingRootEvents: DurableRootEvent<AnyEventObject>[] = [];
+  const deliveredRootEvents: DurableRootEvent<AnyEventObject>[] = [];
+
+  const registerRootMailbox = (actor: AnyActor) =>
+    registerDurableMailbox(actor, () => [
+      ...deliveredRootEvents,
+      ...pendingRootEvents,
+      ...(currentBatch?.rootEvents ?? [])
+    ]);
 
   // Every inter-actor edge is an async handoff to the runtime, and every
   // handoff queues behind the last one: hosts whose step or activity model
@@ -447,8 +474,30 @@ export function createDurable<TLogic extends AnyActorLogic>(
 
   // Hands an operation over according to where it was initiated: batched
   // during `executeEffects`, immediate while the loop is parked.
-  const dispatch = (run: () => void | PromiseLike<void>) =>
-    currentBatch ? handOff(currentBatch, run) : run();
+  const dispatch = (
+    run: () => void | PromiseLike<void>,
+    acceptsSend = false
+  ) => {
+    const effect = getExecutingPendingEffect();
+    const execute = () => {
+      const invoke = () => {
+        const result = run();
+        if (
+          acceptsSend &&
+          effect?.kind === 'builtin' &&
+          (effect.type === '@xstate.sendTo' ||
+            effect.type === '@xstate.raise') &&
+          effect.delay === undefined &&
+          (!result || typeof result.then !== 'function')
+        ) {
+          acceptPendingEffect(effect);
+        }
+        return result;
+      };
+      return effect ? withPendingEffect(effect, invoke) : invoke();
+    };
+    return currentBatch ? handOff(currentBatch, execute) : execute();
+  };
 
   const drain = async (batch: Batch): Promise<void> => {
     while (batch.pending.size) {
@@ -547,6 +596,33 @@ export function createDurable<TLogic extends AnyActorLogic>(
       wrapped.runLogic = runtime.runLogic;
     }
     wrapped.sendEvent = (source, target, event) => {
+      const send = (run: () => void | PromiseLike<void>) => {
+        const cleanup = registerPendingDelivery(
+          getExecutingPendingEffect(),
+          source,
+          target,
+          event
+        );
+        try {
+          const result = dispatch(run, true);
+          if (result && typeof result.then === 'function') {
+            return Promise.resolve(result).then(
+              () => {
+                cleanup();
+              },
+              (error: unknown) => {
+                cleanup();
+                throw error;
+              }
+            );
+          }
+          cleanup();
+          return result;
+        } catch (error) {
+          cleanup();
+          throw error;
+        }
+      };
       const captureBatch =
         options?.captureRootEvents !== false ? currentBatch : undefined;
       if (
@@ -555,7 +631,7 @@ export function createDurable<TLogic extends AnyActorLogic>(
         !runtime.sendEvent &&
         adapter.enqueueRootEvent
       ) {
-        return dispatch(() => adapter.enqueueRootEvent!(source, event));
+        return send(() => adapter.enqueueRootEvent!(source, event));
       }
       if (
         !captureBatch &&
@@ -570,14 +646,22 @@ export function createDurable<TLogic extends AnyActorLogic>(
       }
       if (captureBatch && target.address === rootAddress) {
         captureBatch.rootEvents.push({ event, source });
+        const effect = getExecutingPendingEffect();
+        if (
+          effect?.kind === 'builtin' &&
+          (effect.type === '@xstate.sendTo' ||
+            effect.type === '@xstate.raise') &&
+          effect.delay === undefined
+        )
+          acceptPendingEffect(effect);
         return;
       }
       const impl = runtime.sendEvent;
       if (impl) {
-        return dispatch(() => impl(source, target, event));
+        return send(() => impl(source, target, event));
       }
       if (localDeliveryFallback) {
-        return dispatch(() => deliverEvent(source, target, event));
+        return send(() => deliverEvent(source, target, event));
       }
       throw new TypeError(
         `The durable runtime does not support the sendEvent operation (target '${target.address}')`
@@ -632,6 +716,20 @@ export function createDurable<TLogic extends AnyActorLogic>(
     snapshot: TSnapshot,
     recursive = false
   ): TSnapshot {
+    const associated = peekSnapshotActorRef(snapshot as Snapshot<unknown>);
+    if (associated) {
+      registerRootMailbox(associated.actor);
+    } else {
+      const provide = getSnapshotActorRefProvider(
+        snapshot as Snapshot<unknown>
+      );
+      if (provide)
+        setLazySnapshotActorRef(snapshot as Snapshot<unknown>, () => {
+          const ref = provide();
+          registerRootMailbox(ref.actor);
+          return ref;
+        });
+    }
     if ((snapshot as Snapshot<unknown>).status === 'error') {
       const root = getSnapshotActorRef(snapshot as Snapshot<unknown>)?.actor;
       if (root && !observedRoots.has(root)) {
@@ -700,6 +798,11 @@ export function createDurable<TLogic extends AnyActorLogic>(
       ) {
         throw new Error('restore() requires a fresh durable execution');
       }
+      const recovery = readRecoveryEnvelope(persistedSnapshot);
+      if (recovery?.mailbox?.length || recovery?.effectMailbox?.length)
+        throw new Error(
+          'Pending mailbox work must be restored with its owning actor runtime.'
+        );
       const { snapshot, scope } = withSystemInspector(inspect, () =>
         withExecutionIdentity(executionIdentity, () => {
           const scope = createInertActorScope(logic);
@@ -718,6 +821,20 @@ export function createDurable<TLogic extends AnyActorLogic>(
           };
         })
       );
+      const savedMailbox =
+        readRecoveryEnvelope(persistedSnapshot)?.durableMailbox;
+      if (savedMailbox)
+        pendingRootEvents.push(
+          ...restoreDurableMailbox(scope.self, savedMailbox)
+        );
+      const continuation = hydratePendingEffects(scope.self);
+      const continuationStarts = new Set(
+        continuation.flatMap((effect) =>
+          effect.kind === 'builtin' && effect.type === '@xstate.start'
+            ? [effect.actor.address]
+            : []
+        )
+      );
       const effects: ExecutableEffect[] = [];
       if ((snapshot as Snapshot<unknown>).status === 'active') {
         const { children, timers } = snapshot as {
@@ -728,22 +845,36 @@ export function createDurable<TLogic extends AnyActorLogic>(
           if (
             child &&
             !isRemoteActorRef(child) &&
-            child.getSnapshot().status === 'active'
+            (child.getSnapshot().status === 'active' ||
+              hasRestoredPendingEffects(child)) &&
+            !continuationStarts.has(child.address)
           ) {
             effects.push(createStartEffect(child));
           }
         }
         for (const timer of timers ?? []) {
-          const effect = createTimerEffect(scope, timer, timer.delay);
+          const pendingTimer = continuation.find(
+            (effect) =>
+              effect.kind === 'builtin' &&
+              (effect.type === '@xstate.raise' ||
+                effect.type === '@xstate.sendTo') &&
+              effect.delay !== undefined &&
+              effect.source.address === scope.self.address &&
+              matchesTimerKey(timer, getTimerKey(effect))
+          );
+          const effect =
+            pendingTimer ?? createTimerEffect(scope, timer, timer.delay);
           if (timer.scheduledAt !== undefined) {
             restoredTimerDeadlines.set(effect, {
               deadline: timer.scheduledAt + timer.delay,
               delay: timer.delay
             });
           }
-          effects.push(effect);
+          if (!pendingTimer) effects.push(effect);
         }
       }
+      effects.push(...continuation);
+      setPendingEffects(scope.self, effects);
       restored = true;
       return [
         snapshot,
@@ -761,7 +892,10 @@ export function createDurable<TLogic extends AnyActorLogic>(
           initialTransition(logic, ...args)
         )
       );
-      return [installSystemRuntime(snapshot), tagEffects(effects)];
+      const installed = installSystemRuntime(snapshot);
+      if (effects.length)
+        setPendingEffects(getSnapshotActorRef(installed)!.actor, effects);
+      return [installed, tagEffects(effects)];
     },
     transition(snapshot, event) {
       const [nextSnapshot, effects] = withSystemInspector(inspect, () =>
@@ -769,7 +903,14 @@ export function createDurable<TLogic extends AnyActorLogic>(
           transition(logic, snapshot, event)
         )
       );
-      return [installSystemRuntime(nextSnapshot), tagEffects(effects)];
+      const installed = installSystemRuntime(nextSnapshot);
+      const delivered = deliveredRootEvents.findIndex(
+        (item) => item.event === event
+      );
+      if (delivered !== -1) deliveredRootEvents.splice(delivered, 1);
+      if (effects.length)
+        setPendingEffects(getSnapshotActorRef(installed)!.actor, effects);
+      return [installed, tagEffects(effects)];
     },
     getActorRef(snapshot, address) {
       const root = getSnapshotActorRef(snapshot as Snapshot<unknown>)?.actor;
@@ -820,13 +961,25 @@ export function createDurable<TLogic extends AnyActorLogic>(
           if (effect.kind === 'action') {
             // Custom actions have no default-parameter fallback to the actor's
             // system, so hand them the wrapped system runtime directly.
-            await adapter.executeAction(
-              effect,
-              metadata,
-              runtime ?? wrappedSystemRuntime ?? {}
+            const result = withPendingEffect(effect, () =>
+              adapter.executeAction(
+                effect,
+                metadata,
+                runtime ?? wrappedSystemRuntime ?? {}
+              )
             );
+            if (!result || typeof result.then !== 'function')
+              acceptPendingEffect(effect);
+            await result;
+            acceptPendingEffect(effect);
           } else {
-            await effect.exec(runtime);
+            const result = withPendingEffect(effect, () =>
+              effect.exec(runtime)
+            );
+            if (!result || typeof result.then !== 'function')
+              acceptPendingEffect(effect);
+            await result;
+            acceptPendingEffect(effect);
           }
         }
         await settle(batch);
@@ -853,6 +1006,7 @@ export function createDurable<TLogic extends AnyActorLogic>(
       // before durably waiting for an external event.
       const queued = pendingRootEvents.shift();
       if (queued) {
+        deliveredRootEvents.push(queued);
         return queued.event as EventFromLogic<TLogic>;
       }
       return adapter.waitForEvent({

@@ -7,6 +7,25 @@ export class Mailbox<T> {
   private _active: boolean = false;
   private _current: MailboxItem<T> | null = null;
   private _last: MailboxItem<T> | null = null;
+  private _processing = false;
+  private _committed = false;
+
+  public commitCurrent(): void {
+    if (this._processing) this._committed = true;
+  }
+
+  public pending(): T[] {
+    const values: T[] = [];
+    let item =
+      this._processing && this._committed
+        ? (this._current?.next ?? null)
+        : this._current;
+    while (item) {
+      values.push(item.value);
+      item = item.next;
+    }
+    return values;
+  }
 
   constructor(private _process: (ev: T) => void) {}
 
@@ -49,7 +68,13 @@ export class Mailbox<T> {
       // atm the given _process is responsible for implementing proper try/catch handling
       // we assume here that this won't throw in a way that can affect this mailbox
       const consumed = this._current;
-      this._process(consumed.value);
+      this._processing = true;
+      this._committed = false;
+      try {
+        this._process(consumed.value);
+      } finally {
+        this._processing = false;
+      }
       this._current = consumed.next;
     }
     this._last = null;

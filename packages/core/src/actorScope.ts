@@ -3,6 +3,28 @@ import type { AnyActor, AnyActorScope } from './types.ts';
 /** Marks the internal lazy scope without imposing structure on custom runtimes. @internal */
 export const lazyActorScope = Symbol();
 
+const lazyCapabilities = new WeakMap<object, Map<string, () => unknown>>();
+
+function markLazyCapabilities(value: object, keys: readonly string[]): void {
+  const getters = new Map<string, () => unknown>();
+  for (const key of keys) {
+    const getter = Object.getOwnPropertyDescriptor(value, key)?.get;
+    if (getter) getters.set(key, getter);
+  }
+  lazyCapabilities.set(value, getters);
+}
+
+/** @internal Identifies framework-owned lazy transition argument accessors. */
+export function hasLazyActorCapability(
+  value: object,
+  key: string,
+  getter: (() => unknown) | undefined
+): boolean {
+  return (
+    getter !== undefined && lazyCapabilities.get(value)?.get(key) === getter
+  );
+}
+
 type InternalActorScope = AnyActorScope & {
   _parent?: AnyActor;
   [lazyActorScope]?: true;
@@ -34,6 +56,7 @@ export function withActorSelf<T extends object>(
     enumerable: true,
     get: () => actorScope.self
   });
+  markLazyCapabilities(args, ['self']);
   return args as T & Pick<AnyActorScope, 'self'>;
 }
 
@@ -50,6 +73,7 @@ export function withActorSelfAndParent<T extends object>(
     self: { enumerable: true, get: () => actorScope.self },
     parent: { enumerable: true, get: () => getActorScopeParent(actorScope) }
   });
+  markLazyCapabilities(args, ['self', 'parent']);
   return args as T &
     Pick<AnyActorScope, 'self'> & { parent: AnyActor | undefined };
 }
@@ -78,6 +102,7 @@ export function withActorScope<T extends object>(
     system: { enumerable: true, get: () => actorScope.system },
     parent: { enumerable: true, get: () => getActorScopeParent(actorScope) }
   });
+  markLazyCapabilities(args, ['self', 'system', 'parent']);
   return args as T &
     Pick<AnyActorScope, 'self' | 'system'> & {
       parent: AnyActor | undefined;

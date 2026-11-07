@@ -1,3 +1,6 @@
+import { persistDurableMailbox } from './durableMailbox.ts';
+import { addRecoveryEnvelope } from './recoveryEnvelope.ts';
+import { persistPendingEffects } from './pendingEffects.ts';
 import { getTimerStart } from './timerClock.ts';
 import { getScheduledTimerKey, getTimerKey } from './timerKey.ts';
 import isDevelopment from '#is-development';
@@ -946,6 +949,9 @@ export function getPersistedSnapshot<
     historyValue: serializeHistoryValue(jsonValues.historyValue)
   };
 
+  const pendingEffects =
+    snapshotActor && persistPendingEffects(snapshotActor, embedChildren);
+
   if (_stateInputs && Object.keys(_stateInputs).length > 0) {
     persisted.stateInputs = _stateInputs;
   }
@@ -957,7 +963,15 @@ export function getPersistedSnapshot<
     };
   }
 
-  return persisted as Snapshot<unknown>;
+  const durableMailbox = snapshotActor && persistDurableMailbox(snapshotActor);
+  return (
+    pendingEffects || durableMailbox
+      ? addRecoveryEnvelope(persisted, {
+          ...(pendingEffects && { effects: pendingEffects }),
+          ...(durableMailbox && { durableMailbox })
+        })
+      : persisted
+  ) as Snapshot<unknown>;
 }
 
 function warnOnNonJsonPayload(

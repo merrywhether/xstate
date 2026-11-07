@@ -1,3 +1,7 @@
+import {
+  hasPendingChildStart,
+  hasRestoredPendingEffects
+} from './pendingEffects.ts';
 import isDevelopment from '#is-development';
 import { xstateError } from './xstateError.ts';
 import { createActor } from './createActor.ts';
@@ -1335,7 +1339,9 @@ export class StateMachine<
       const child = children[childId];
       if (
         (child as any)._rehydrated &&
-        (child as any).getSnapshot?.().status === 'active'
+        (!actorScope || !hasPendingChildStart(actorScope.self, child)) &&
+        ((child as any).getSnapshot?.().status === 'active' ||
+          hasRestoredPendingEffects(child))
       ) {
         if (actorScope) {
           actorScope.actionExecutor(createStartEffect(child));

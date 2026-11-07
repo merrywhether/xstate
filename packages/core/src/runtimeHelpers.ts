@@ -1,3 +1,8 @@
+import {
+  acceptPendingDelivery,
+  acceptPendingEffect,
+  getExecutingPendingEffect
+} from './pendingEffects.ts';
 import isDevelopment from '#is-development';
 import { xstateError } from './xstateError.ts';
 import {
@@ -170,6 +175,19 @@ export function deliverEvent(
     _send(event: AnyEventObject, sourceRef?: AnyActor): void;
   };
 
+  const accepted = acceptPendingDelivery(source, target, event);
+  const effect = getExecutingPendingEffect();
+  if (
+    !accepted &&
+    effect?.kind === 'builtin' &&
+    effect.type === '@xstate.sendTo' &&
+    effect.delay === undefined &&
+    effect.source === source &&
+    effect.target === target &&
+    effect.event === event
+  ) {
+    acceptPendingEffect(effect);
+  }
   runtimeTarget._send(event, source);
 }
 

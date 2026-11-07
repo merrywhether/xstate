@@ -178,6 +178,13 @@ const effectStates = new WeakMap<
   Map<PropertyKey, { cleanup?: () => void }>
 >();
 
+const restartedStepEffects = new WeakSet<object>();
+
+/** @internal */
+export function isRestartedStepEffect(effect: object): boolean {
+  return restartedStepEffects.has(effect);
+}
+
 function getEffectState(self: AnyActorRef) {
   let state = effectStates.get(self);
   if (!state) {
@@ -405,14 +412,14 @@ export function createStepLogic<
       ) {
         return;
       }
-      effects.push(
-        createCustomEffect(
-          '@xstate.effect',
-          (runtime = actorScope.self.system) =>
-            executeLogicEffect(actorScope.self, key, () => exec(runtime)),
-          { key }
-        )
+      const attachment = createCustomEffect(
+        '@xstate.effect',
+        (runtime = actorScope.self.system) =>
+          executeLogicEffect(actorScope.self, key, () => exec(runtime)),
+        { key }
       );
+      if (event.type === XSTATE_INIT) restartedStepEffects.add(attachment);
+      effects.push(attachment);
       trackedEffects[key] = { status: 'active' };
     };
     const enq: StepLogicEnqueue<TEvent, TEmitted> = {
@@ -438,15 +445,13 @@ export function createStepLogic<
         const exec = keyOrExec as (
           runtime?: Partial<ActorSystemRuntime>
         ) => void | (() => void);
-        effects.push(
-          createCustomEffect(
-            '@xstate.effect',
-            (runtime = actorScope.self.system) =>
-              executeLogicEffect(actorScope.self, undefined, () =>
-                exec(runtime)
-              )
-          )
+        const attachment = createCustomEffect(
+          '@xstate.effect',
+          (runtime = actorScope.self.system) =>
+            executeLogicEffect(actorScope.self, undefined, () => exec(runtime))
         );
+        if (event.type === XSTATE_INIT) restartedStepEffects.add(attachment);
+        effects.push(attachment);
       }) as StepLogicEnqueue<TEvent, TEmitted>['effect']
     };
 

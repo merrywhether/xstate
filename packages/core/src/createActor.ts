@@ -1,3 +1,19 @@
+import {
+  addRecoveryEnvelope,
+  type RecoveryEnvelope
+} from './recoveryEnvelope.ts';
+import { isMachineSnapshot } from './State.ts';
+import {
+  acceptPendingEffect,
+  discardPendingEffects,
+  discardPendingSuffix,
+  hydratePendingEffects,
+  persistEffectValue,
+  persistPendingEffects,
+  restoreEffectValue,
+  setPendingEffects,
+  withPendingEffect
+} from './pendingEffects.ts';
 import isDevelopment from '#is-development';
 import { xstateError } from './xstateError.ts';
 import { diagnoseActorOptions } from './devDiagnostics.ts';
@@ -8,7 +24,8 @@ import { XSTATE_STOP, XSTATE_TIMER } from './constants.ts';
 import {
   createDoneActorEvent,
   createErrorActorEvent,
-  createInitEvent
+  createInitEvent,
+  restoreChildLifecycleEvent
 } from './eventUtils.ts';
 import { reportUnhandledError } from './reportUnhandledError.ts';
 import { symbolObservable } from './symbolObservable.ts';
@@ -56,7 +73,7 @@ import type {
   ReservedMachineEvent,
   SerializedActorRef
 } from './types.ts';
-import { getTimerKey } from './timerKey.ts';
+import { getTimerKey, matchesTimerKey } from './timerKey.ts';
 import {
   ActorOptions,
   ActorInstance,
@@ -127,6 +144,7 @@ function executeExecutableEffects(
     return;
   }
 
+  setPendingEffects(actorScope.self, effects);
   for (const effect of effects) {
     actorScope.actionExecutor(effect);
   }
@@ -184,6 +202,72 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
   ) => void;
   private mailbox?: Mailbox<ActorMailboxEvent<EventFromLogic<TLogic>>>;
   private _mailboxStarted = false;
+  private _restoredMailbox: unknown[] | undefined;
+
+  /** @internal */
+  public _restoreLifecycleEvent<T extends EventObject>(
+    event: T,
+    capturedChildSession: string | undefined
+  ): T | undefined {
+    const actorId = (event as T & { actorId?: unknown }).actorId;
+    const children = (
+      this._snapshot as { children?: Record<string, AnyActor | undefined> }
+    ).children;
+    const child = typeof actorId === 'string' ? children?.[actorId] : undefined;
+    return restoreChildLifecycleEvent(
+      event,
+      capturedChildSession,
+      child?.sessionId,
+      isMachineSnapshot(this._snapshot)
+    );
+  }
+
+  /** @internal */
+  public _restoreMailbox(items: unknown[]): void {
+    this._restoredMailbox = items;
+  }
+
+  private _enqueueRestoredMailbox(): void {
+    const items = this._restoredMailbox;
+    if (!items?.length) return;
+    const restoredItems: ActorMailboxEvent<EventFromLogic<TLogic>>[] = [];
+    for (const item of items) {
+      const decoded = restoreEffectValue(item, this) as ActorMailboxEvent<
+        EventFromLogic<TLogic>
+      > & { currentChildSession?: string };
+      if (
+        !decoded ||
+        typeof decoded !== 'object' ||
+        !decoded.event ||
+        typeof decoded.event !== 'object' ||
+        typeof decoded.event.type !== 'string' ||
+        (decoded.sourceRef !== undefined &&
+          (!decoded.sourceRef ||
+            typeof decoded.sourceRef._send !== 'function')) ||
+        (decoded.currentChildSession !== undefined &&
+          typeof decoded.currentChildSession !== 'string')
+      )
+        throw new Error('Invalid persisted actor mailbox event.');
+      const event = decoded.event;
+      const restoredEvent = this._restoreLifecycleEvent(
+        event as unknown as EventObject,
+        decoded.currentChildSession
+      );
+      if (!restoredEvent) continue;
+      restoredItems.push({
+        event: restoredEvent as EventFromLogic<TLogic>,
+        sourceRef: decoded.sourceRef
+      });
+    }
+    // Decoding requires the linked tree; queue the saved prefix before any
+    // inputs accepted by this restored actor while it was still unstarted.
+    const queuedItems = this.mailbox?.pending() ?? [];
+    this.mailbox = undefined;
+    this._restoredMailbox = undefined;
+    for (const { event, sourceRef } of [...restoredItems, ...queuedItems]) {
+      this._send(event, sourceRef);
+    }
+  }
 
   private observers?: Set<Observer<SnapshotFrom<TLogic>>>;
   /** Whether a consumer subscribed to this actor's error after it errored. */
@@ -368,6 +452,7 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
         );
         this._setSnapshot(snapshot);
         this._initialEffects = effects.length ? effects : undefined;
+        setPendingEffects(this, effects);
       }
     } catch (err) {
       // Restored logic may keep its snapshot shape on restore failures (e.g.
@@ -489,18 +574,28 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
       const saveExecutingCustomAction = executingCustomAction;
       try {
         executingCustomAction = true;
-        const result = action.exec();
+        const result = withPendingEffect(action, () => action.exec());
         if (
           result &&
           typeof (result as PromiseLike<unknown>).then === 'function'
         ) {
-          void Promise.resolve(result).catch((err) => {
-            if (this._processingStatus === ProcessingStatus.Stopped) {
-              return;
+          if (action.kind === 'action') acceptPendingEffect(action);
+          void Promise.resolve(result).then(
+            () => acceptPendingEffect(action),
+            (err) => {
+              acceptPendingEffect(action);
+              if (this._processingStatus === ProcessingStatus.Stopped) {
+                return;
+              }
+              this._recoverOrError(err);
             }
-            this._recoverOrError(err);
-          });
+          );
+        } else {
+          acceptPendingEffect(action);
         }
+      } catch (error) {
+        discardPendingSuffix(action);
+        throw error;
       } finally {
         executingCustomAction = saveExecutingCustomAction;
       }
@@ -519,6 +614,7 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
   private _setSnapshot(snapshot: SnapshotFrom<TLogic>): void {
     const previousSnapshot = this._snapshot;
     this._snapshot = snapshot;
+    this.mailbox?.commitCurrent();
     setSnapshotActorRef(snapshot, this, this.system, previousSnapshot);
   }
 
@@ -886,6 +982,25 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
         // a state machine can be "done" upon initialization (it could reach a final state using initial microsteps)
         // we still need to complete observers, flush deferreds etc
         if (this._restored) {
+          let pendingEffects: ExecutableEffect[];
+          try {
+            pendingEffects = hydratePendingEffects(this);
+          } catch (error) {
+            this._setErrorSnapshot(error);
+            this._error(error);
+            return this;
+          }
+          if (pendingEffects.length) {
+            // Terminal continuations may still have a parent notification to deliver.
+            try {
+              executeExecutableEffects(pendingEffects, this._actorScope);
+            } catch (error) {
+              this._recoverOrError(error);
+            }
+            return this;
+          }
+        }
+        if (this._restored) {
           // Restoration does not replay the transition that originally
           // terminated the actor, and must not notify the parent again.
           this._next(this._snapshot);
@@ -923,6 +1038,25 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
       return this;
     }
 
+    let restoredEffects: ExecutableEffect[] = [];
+    if (this._restored) {
+      try {
+        this._enqueueRestoredMailbox();
+        restoredEffects = hydratePendingEffects(this);
+      } catch (error) {
+        this._setErrorSnapshot(error);
+        this._error(error);
+        return this;
+      }
+    }
+    const pendingTimers = restoredEffects.flatMap((effect) =>
+      effect.kind === 'builtin' &&
+      (effect.type === '@xstate.raise' ||
+        (effect.type === '@xstate.sendTo' && effect.delay !== undefined))
+        ? [getTimerKey(effect)]
+        : []
+    );
+
     if (this.logic.start) {
       try {
         this.logic.start(this._snapshot, this._actorScope, {
@@ -933,6 +1067,14 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
         this._error(err);
         return this;
       }
+    }
+
+    try {
+      executeExecutableEffects(restoredEffects, this._actorScope);
+    } catch (error) {
+      this._recoverOrError(error);
+      if ((this._snapshot as Snapshot<unknown>).status !== 'active')
+        return this;
     }
 
     if (
@@ -971,6 +1113,8 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
       const wallClock = !this.system._clock.now;
       const now = Date.now();
       for (const timer of timers) {
+        if (pendingTimers.some((effect) => matchesTimerKey(timer, effect)))
+          continue;
         // A timer persisted from a live runtime carries its wall-clock start;
         // honor the absolute deadline instead of restarting the full delay.
         // Without a start (a pure-transition snapshot, or an older snapshot)
@@ -1114,6 +1258,7 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
 
   /** @internal */
   public _stop(): this {
+    discardPendingEffects(this);
     if (this._processingStatus === ProcessingStatus.Stopped) {
       return this;
     }
@@ -1295,6 +1440,16 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
     return { $actor: this.address };
   }
 
+  /** @internal */
+  public _persistEffectValue(value: unknown): unknown {
+    return persistEffectValue(value, this);
+  }
+
+  /** @internal */
+  public _restoreEffectValue(value: unknown): unknown {
+    return restoreEffectValue(value, this);
+  }
+
   /**
    * Obtain the internal state of the actor, which can be persisted.
    *
@@ -1318,10 +1473,59 @@ export class Actor<TLogic extends AnyActorLogic> implements ActorInstance<
     embedChildren?: boolean;
   }): PersistedSnapshotOf<TLogic>;
   public getPersistedSnapshot(options?: unknown): PersistedSnapshotOf<TLogic> {
-    return this.logic.getPersistedSnapshot(
-      this._snapshot,
-      options
+    let snapshot = this.logic.getPersistedSnapshot(this._snapshot, options);
+    const pendingMailbox = (this.mailbox?.pending() ?? []).filter((item) => {
+      const actorId = (item.event as EventObject & { actorId?: unknown })
+        .actorId;
+      const children = (
+        this._snapshot as { children?: Record<string, AnyActor | undefined> }
+      ).children;
+      const sessionId =
+        typeof actorId === 'string'
+          ? children?.[actorId]?.sessionId
+          : undefined;
+      return (
+        this._restoreLifecycleEvent(item.event as EventObject, sessionId) !==
+        undefined
+      );
+    });
+    if (this._restoredMailbox?.length || pendingMailbox.length) {
+      snapshot = addRecoveryEnvelope(snapshot, {
+        mailbox: [
+          ...(this._restoredMailbox ?? []),
+          ...pendingMailbox.map((item) => {
+            const actorId = (item.event as EventObject & { actorId?: unknown })
+              .actorId;
+            const children = (
+              this._snapshot as {
+                children?: Record<string, AnyActor | undefined>;
+              }
+            ).children;
+            const currentChildSession =
+              typeof actorId === 'string'
+                ? children?.[actorId]?.sessionId
+                : undefined;
+            return persistEffectValue({ ...item, currentChildSession }, this);
+          })
+        ]
+      });
+    }
+    if (isMachineSnapshot(this._snapshot))
+      return snapshot as PersistedSnapshotOf<TLogic>;
+    const pendingEffects = persistPendingEffects(this);
+    return (
+      pendingEffects
+        ? addRecoveryEnvelope(snapshot, { effects: pendingEffects })
+        : snapshot
     ) as PersistedSnapshotOf<TLogic>;
+  }
+
+  /** @internal */
+  public _addRecoveryMetadata<T>(
+    snapshot: T,
+    fields: Partial<Omit<RecoveryEnvelope, 'type' | 'version'>>
+  ): T {
+    return addRecoveryEnvelope(snapshot, fields);
   }
 
   public [symbolObservable](): InteropSubscribable<SnapshotFrom<TLogic>> {

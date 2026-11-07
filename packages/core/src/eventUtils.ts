@@ -9,6 +9,32 @@ import {
   TimeoutEvent
 } from './types.ts';
 
+/** @internal Restores the incarnation of a queued machine lifecycle event. */
+export function restoreChildLifecycleEvent<T extends { type: string }>(
+  event: T,
+  capturedChildSession: string | undefined,
+  restoredChildSession: string | undefined,
+  isMachine: boolean
+): T | undefined {
+  if (
+    !isMachine ||
+    capturedChildSession === undefined ||
+    (event.type !== 'xstate.done.actor' &&
+      event.type !== 'xstate.error.actor' &&
+      event.type !== 'xstate.snapshot.actor' &&
+      event.type !== 'xstate.timeout.actor')
+  )
+    return event;
+  const sessionId = (event as T & { sessionId?: unknown }).sessionId;
+  if (typeof sessionId !== 'string') return event;
+  // The captured child already had another incarnation, so the original
+  // machine would ignore this lifecycle event even if IDs are reused later.
+  if (sessionId !== capturedChildSession) return undefined;
+  return restoredChildSession === undefined
+    ? event
+    : { ...event, sessionId: restoredChildSession };
+}
+
 /**
  * Returns an event that represents an implicit event that is sent after the
  * specified `delay`.

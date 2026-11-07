@@ -48,7 +48,8 @@ when `captureRootEvents` is `false`. Implement
 `sendEvent` only when the host owns routing for every target. That override
 replaces local delivery completely; call `deliverEvent(source, target, event)`
 for co-located targets instead of `target.send(event)`, which re-enters the
-runtime.
+runtime. Forward the event object unchanged so pending-work recovery can match
+the accepted handoff.
 
 The primary durable unit for async work is the actor itself: a developer
 writes a normal promise (`fromPromise`, `createAsyncLogic`) and invokes it;
@@ -338,6 +339,8 @@ event reaches `enqueueRootEvent`, or `sendEvent` when the adapter implements
 the broader routing override, and belongs in the host's mailbox. Producing one
 without either hook throws, since delivering it locally to the inert root
 would silently lose it.
+
+The persisted machine snapshot also records this execution’s captured root queue, including a reply handed out by `waitForEvent()` whose transition has not committed yet. `execution.restore()` restores those replies before reading new host events. Restore a snapshot containing that queue with the durable execution runtime. Host-owned messages and their journal remain the adapter’s responsibility.
 
 For a live host with a FIFO mailbox, pass `{ captureRootEvents: false }` as
 the third argument to `createDurable`. Root events then reach the adapter's

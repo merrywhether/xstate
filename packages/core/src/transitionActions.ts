@@ -217,6 +217,23 @@ export function createCustomEffect(
   };
 }
 
+/** @internal Recreates a registered action without rerunning a transition. */
+export function createRegisteredActionEffect(
+  type: string,
+  action: (...args: unknown[]) => void | PromiseLike<void>,
+  args: unknown[],
+  params: unknown
+): CustomExecutableEffect {
+  return {
+    kind: 'action',
+    type,
+    action,
+    args,
+    params,
+    exec: execCustomEffect
+  };
+}
+
 function execSpawnEffect(
   this: SpawnExecutableEffect,
   runtime: EffectRuntime = this.actor.system
@@ -1107,6 +1124,39 @@ export function createSpawnEffect(actor: AnyActor): SpawnExecutableEffect {
     logic: (actor as any).logic,
     src: actor.src,
     input: (actor as any).options?.input
+  };
+}
+
+/** @internal Recreates a resolved cancellation. */
+export function createCancelEffect(
+  scope: AnyActorScope,
+  key: TimerKey
+): CancelExecutableEffect {
+  return {
+    kind: 'builtin',
+    type: '@xstate.cancel',
+    source: scope.self,
+    ...key,
+    args: [scope, key],
+    params: undefined,
+    exec: execCancelEffect
+  };
+}
+
+/** @internal Recreates a resolved actor stop. */
+export function createStopEffect(
+  scope: AnyActorScope,
+  actor: AnyActor
+): StopExecutableEffect {
+  return {
+    kind: 'builtin',
+    type: '@xstate.stop',
+    source: scope.self,
+    actor,
+    id: actor.id,
+    args: [scope, actor],
+    params: undefined,
+    exec: execStopEffect
   };
 }
 
